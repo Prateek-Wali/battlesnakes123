@@ -1,0 +1,22 @@
+[package]
+name        = "battlesnake"
+version     = "1.0.0"
+edition     = "2021"
+description = "BattleSnake Elite AI — 20,000 turn survival engine"
+
+[[bin]]
+name = "battlesnake"
+path = "src/main.rs"
+
+[dependencies]
+actix-web  = "4"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio      = { version = "1", features = ["full"] }
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+panic         = "abort"
+strip         = true
