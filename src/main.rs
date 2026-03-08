@@ -42,6 +42,7 @@ const MAX_HP:       i32 = 100;
 const HP_CRITICAL:  i32 = 25;
 const HP_LOW:       i32 = 60;
 const HP_MEDIUM:    i32 = 80;
+const HP_PROACTIVE: i32 = 90;
 #[allow(dead_code)]
 const COIL_RATIO:   f32 = 1.5;
 const MM_BUDGET:    u32 = 50_000;
@@ -492,19 +493,25 @@ fn score_food(state: &State, obs: Bb) -> Option<(i32, u32, Dir)> {
         // Base score: closer is better
         let mut score: i32 = 1000 - dist as i32 * 10;
 
-        // Check if contested — is any enemy closer or equidistant?
+        // Check if contested — use A* for enemy distance when possible
         let mut contested = false;
         for i in 1..state.n_snakes {
             let e = &state.snakes[i];
             if !e.alive { continue; }
-            let e_dist = manhattan(e.head(), f);
+            // Use A* distance for accurate enemy pathfinding (fix W8)
+            let e_dist = astar(e.head(), f, obs)
+                .map(|(d, _)| d as i32)
+                .unwrap_or(manhattan(e.head(), f));
             if e_dist <= dist as i32 {
                 contested = true;
-                // Extra penalty if enemy is bigger (head-on risk)
+                // Softer penalty when hungry — hungry snakes shouldn't be picky (fix W1)
                 if e.length >= me.length {
-                    score -= 200;
+                    let penalty = if me.health <= HP_LOW { 80 }
+                                  else if me.health <= HP_MEDIUM { 120 }
+                                  else { 150 };
+                    score -= penalty;
                 } else {
-                    score -= 50; // contested but we can win head-on
+                    score -= 30; // contested but we can win head-on
                 }
             }
         }
@@ -515,12 +522,12 @@ fn score_food(state: &State, obs: Bb) -> Option<(i32, u32, Dir)> {
         for i in 1..state.n_snakes {
             let e = &state.snakes[i];
             if !e.alive || e.length < me.length { continue; }
-            if manhattan(e.head(), f) <= 2 { score -= 80; }
+            if manhattan(e.head(), f) <= 2 { score -= 60; }
         }
 
         // Prefer food closer to center (less trapping risk)
         let center = cell(W/2, H/2);
-        score -= manhattan(f, center) * 2;
+        score -= manhattan(f, center) * 3;
 
         // Space check: does going toward this food lead to open space?
         if let Some(nc) = dir.step(head) {
@@ -563,11 +570,11 @@ fn cutoff_score(state: &State, my_dir: Dir, obs: Bb) -> i32 {
         let space_lost = e_space_before as i32 - e_space_after as i32;
 
         if e_space_after < e.length as u32 {
-            // Enemy is trapped! Bonus, but only if WE have enough space
-            let kill_value = if n_enemies <= 1 { 400 } else { 250 };
+            // Enemy is trapped! Bonus, but only if WE have enough space (fix W5: boosted)
+            let kill_value = if n_enemies <= 1 { 600 } else { 350 };
             score += kill_value;
         } else if space_lost > 5 {
-            score += space_lost * 2; // reduced from 3 to be less aggressive
+            score += space_lost * 3;
         }
     }
 
@@ -824,17 +831,28 @@ fn evaluate(state: &State) -> i32 {
                           else                 { my_fill as i32 - body_len * 25 };
 
     // 2. Food scoring — smart multi-food evaluation
+    //    ALWAYS value food — being longer is the #1 win condition
+    let max_e_len = (1..state.n_snakes)
+        .filter(|&i| state.snakes[i].alive)
+        .map(|i| state.snakes[i].length as i32)
+        .max()
+        .unwrap_or(0);
+    let length_gap = max_e_len - body_len; // positive = we're shorter
     let food_score: i32 = match score_food(state, obs_tight) {
         Some((_fscore, dist, _)) => {
             let dist = dist as i32;
             if dist >= me.health {
                 -80_000 + dist * 100
             } else {
-                let urgency: i32 = if me.health <= HP_CRITICAL { 500 }
-                                   else if me.health <= HP_LOW  { 200 }
-                                   else if me.health <= HP_MEDIUM{ 50 }
-                                   else                          { 15 };
-                urgency * 30 / (dist + 1)
+                // Base urgency: always want food (raised dramatically)
+                let hp_urgency: i32 = if me.health <= HP_CRITICAL { 600 }
+                                      else if me.health <= HP_LOW  { 300 }
+                                      else if me.health <= HP_MEDIUM{ 150 }
+                                      else if me.health <= HP_PROACTIVE { 100 }
+                                      else                          { 80 };
+                // Extra urgency when shorter than enemies
+                let growth_urgency = if length_gap > 0 { length_gap * 40 } else { 0 };
+                (hp_urgency + growth_urgency) * 30 / (dist + 1)
             }
         }
         None => -60_000, // no reachable food
@@ -846,15 +864,11 @@ fn evaluate(state: &State) -> i32 {
     let voro_score = terr[0] as i32 * if is_1v1 { 10 } else { 5 };
 
     // 4. Length advantage — longer = win head-ons
-    let max_e_len = (1..state.n_snakes)
-        .filter(|&i| state.snakes[i].alive)
-        .map(|i| state.snakes[i].length as i32)
-        .max()
-        .unwrap_or(0);
     let len_score = if body_len > max_e_len {
-        40 + (body_len - max_e_len) * 10
+        60 + (body_len - max_e_len) * 15
     } else {
-        (body_len - max_e_len) * 12
+        // Being shorter is very dangerous — heavy penalty scales with gap
+        (body_len - max_e_len) * 25
     };
 
     // 5. Danger — proximity to larger/equal heads (tuned higher)
@@ -866,8 +880,8 @@ fn evaluate(state: &State) -> i32 {
         if e.length >= me.length {
             danger_score += if d <= 1 { -300 } else if d <= 2 { -120 } else if d <= 3 { -40 } else { 0 };
         } else if d <= 2 {
-            // Offensive: reward being near killable enemy (scaled)
-            danger_score += 40 + (me.length as i32 - e.length as i32) * 10;
+            // Offensive: reward being near killable enemy (scaled) — boosted (fix W5)
+            danger_score += 80 + (me.length as i32 - e.length as i32) * 15;
         }
     }
 
@@ -909,19 +923,20 @@ fn evaluate(state: &State) -> i32 {
         0
     };
 
-    // 9. Wall proximity penalty — edges reduce mobility
+    // 9. Wall proximity penalty — edges reduce mobility (fix W3: 4× increase)
     let hx = cx(head) as i32;
     let hy = cy(head) as i32;
-    let wall_penalty = (if hx == 0 { 5 } else { 0 })
-                     + (if hx == (W as i32 - 1) { 5 } else { 0 })
-                     + (if hy == 0 { 5 } else { 0 })
-                     + (if hy == (H as i32 - 1) { 5 } else { 0 });
-    // Corner = double penalty
-    let corner_penalty = if (hx == 0 || hx == W as i32 - 1) && (hy == 0 || hy == H as i32 - 1) { 15 } else { 0 };
+    let wall_penalty = (if hx == 0 { 20 } else { 0 })
+                     + (if hx == (W as i32 - 1) { 20 } else { 0 })
+                     + (if hy == 0 { 20 } else { 0 })
+                     + (if hy == (H as i32 - 1) { 20 } else { 0 });
+    // Corner = strong penalty (fix W3)
+    let corner_penalty = if (hx == 0 || hx == W as i32 - 1) && (hy == 0 || hy == H as i32 - 1) { 50 } else { 0 };
 
-    // 10. Center control bonus
+    // 10. Center control bonus (fix W6: stronger pull toward center)
     let center = cell(W / 2, H / 2);
-    let center_bonus = -(manhattan(head, center) * 2);
+    let center_dist = manhattan(head, center);
+    let center_bonus = -(center_dist * 5) + if center_dist <= 2 { 15 } else { 0 };
 
     fill_score + food_score + voro_score + len_score + danger_score
         + endgame_score + hp_score - trap_penalty - wall_penalty
@@ -1000,6 +1015,17 @@ fn choose_move(state: &State) -> MoveResult {
     let head = me.head();
     let obs  = state.obs();
 
+    // Fix W7: Early-game food seeking (turn 0-2, stacked bodies)
+    if state.turn <= 2 {
+        if let Some((_, _, dir)) = score_food(state, obs) {
+            if let Some(nc) = dir.step(head) {
+                if !obs.get(nc) && nc != me.neck() {
+                    return MoveResult { dir, mode: "OPENING" };
+                }
+            }
+        }
+    }
+
     let (safe, safe_n, risky, risky_n) = classify(state, obs);
 
     // Build candidate pool: prefer safe, fall back to risky
@@ -1035,20 +1061,23 @@ fn choose_move(state: &State) -> MoveResult {
         e.alive && e.length >= me.length && manhattan(head, e.head()) <= 3
     });
 
-    // FIX 2: Feed when shorter than any alive enemy (growth priority)
+    // ALWAYS feed when shorter — length is the #1 priority
     let shorter_than_enemy = (1..state.n_snakes).any(|i| {
         let e = &state.snakes[i];
         e.alive && e.length > me.length
     });
-    let need_growth = shorter_than_enemy && me.health <= HP_MEDIUM;
+    let need_growth = shorter_than_enemy; // no HP gate — ALWAYS grow when shorter
+    // Proactive feeding: keep HP high even when longest
+    let proactive_feed = !shorter_than_enemy && me.health <= HP_PROACTIVE;
 
-    let mode: &'static str = if critical       { "CRIT-FEED" }
-                             else if trapped    { "COIL"      }
-                             else if low        { "FEED"      }
-                             else if need_growth { "FEED"     }
-                             else if is_1v1     { "1v1"       }
-                             else if threatened  { "EVADE"    }
-                             else               { "CONTROL"   };
+    let mode: &'static str = if critical        { "CRIT-FEED" }
+                             else if trapped     { "COIL"      }
+                             else if low         { "FEED"      }
+                             else if need_growth { "FEED"      }
+                             else if proactive_feed { "FEED"   }
+                             else if is_1v1      { "1v1"       }
+                             else if threatened   { "EVADE"    }
+                             else                { "CONTROL"   };
 
     // ── CRIT-FEED: use smart food scoring to pick best food ──
     if critical {
